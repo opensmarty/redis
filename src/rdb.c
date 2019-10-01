@@ -260,7 +260,7 @@ int rdbEncodeInteger(long long value, unsigned char *enc) {
 
 /* Loads an integer-encoded object with the specified encoding type "enctype".
  * The returned value changes according to the flags, see
- * rdbGenerincLoadStringObject() for more info. */
+ * rdbGenericLoadStringObject() for more info. */
 void *rdbLoadIntegerObject(rio *rdb, int enctype, int flags, size_t *lenptr) {
     int plain = flags & RDB_LOAD_PLAIN;
     int sds = flags & RDB_LOAD_SDS;
@@ -1114,7 +1114,12 @@ ssize_t rdbSaveSingleModuleAux(rio *rdb, int when, moduleType *mt) {
     if (retval == -1) return -1;
     io.bytes += retval;
 
-    /* write the 'when' so that we can provide it on loading */
+    /* write the 'when' so that we can provide it on loading. add a UINT opcode
+     * for backwards compatibility, everything after the MT needs to be prefixed
+     * by an opcode. */
+    retval = rdbSaveLen(rdb,RDB_MODULE_OPCODE_UINT);
+    if (retval == -1) return -1;
+    io.bytes += retval;
     retval = rdbSaveLen(rdb,when);
     if (retval == -1) return -1;
     io.bytes += retval;
@@ -1330,40 +1335,25 @@ werr:
 
 int rdbSaveBackground(char *filename, rdbSaveInfo *rsi) {
     pid_t childpid;
-    long long start;
 
-    if (server.aof_child_pid != -1 || server.rdb_child_pid != -1) return C_ERR;
+    if (hasActiveChildProcess()) return C_ERR;
 
     server.dirty_before_bgsave = server.dirty;
     server.lastbgsave_try = time(NULL);
     openChildInfoPipe();
 
-    start = ustime();
-    if ((childpid = fork()) == 0) {
+    if ((childpid = redisFork()) == 0) {
         int retval;
 
         /* Child */
-        closeListeningSockets(0);
         redisSetProcTitle("redis-rdb-bgsave");
         retval = rdbSave(filename,rsi);
         if (retval == C_OK) {
-            size_t private_dirty = zmalloc_get_private_dirty(-1);
-
-            if (private_dirty) {
-                serverLog(LL_NOTICE,
-                    "RDB: %zu MB of memory used by copy-on-write",
-                    private_dirty/(1024*1024));
-            }
-
-            server.child_info_data.cow_size = private_dirty;
-            sendChildInfo(CHILD_INFO_TYPE_RDB);
+            sendChildCOWInfo(CHILD_INFO_TYPE_RDB, "RDB");
         }
         exitFromChild((retval == C_OK) ? 0 : 1);
     } else {
         /* Parent */
-        server.stat_fork_time = ustime()-start;
-        server.stat_fork_rate = (double) zmalloc_used_memory() * 1000000 / server.stat_fork_time / (1024*1024*1024); /* GB per second. */
-        latencyAddSampleIfNeeded("fork",server.stat_fork_time/1000);
         if (childpid == -1) {
             closeChildInfoPipe();
             server.lastbgsave_status = C_ERR;
@@ -1375,7 +1365,6 @@ int rdbSaveBackground(char *filename, rdbSaveInfo *rsi) {
         server.rdb_save_time_start = time(NULL);
         server.rdb_child_pid = childpid;
         server.rdb_child_type = RDB_CHILD_TYPE_DISK;
-        updateDictResizePolicy();
         return C_OK;
     }
     return C_OK; /* unreached */
@@ -2132,8 +2121,11 @@ int rdbLoadRio(rio *rdb, rdbSaveInfo *rsi, int loading_aof) {
              * Such data can be potentially be stored both before and after the
              * RDB keys-values section. */
             uint64_t moduleid = rdbLoadLen(rdb,NULL);
+            int when_opcode = rdbLoadLen(rdb,NULL);
             int when = rdbLoadLen(rdb,NULL);
             if (rioGetReadError(rdb)) goto eoferr;
+            if (when_opcode != RDB_MODULE_OPCODE_UINT)
+                rdbReportReadError("bad when_opcode");
             moduleType *mt = moduleTypeLookupModuleByID(moduleid);
             char name[10];
             moduleTypeNameByID(name,moduleid);
@@ -2423,10 +2415,9 @@ int rdbSaveToSlavesSockets(rdbSaveInfo *rsi) {
     listNode *ln;
     listIter li;
     pid_t childpid;
-    long long start;
     int pipefds[2];
 
-    if (server.aof_child_pid != -1 || server.rdb_child_pid != -1) return C_ERR;
+    if (hasActiveChildProcess()) return C_ERR;
 
     /* Before to fork, create a pipe that will be used in order to
      * send back to the parent the IDs of the slaves that successfully
@@ -2462,8 +2453,7 @@ int rdbSaveToSlavesSockets(rdbSaveInfo *rsi) {
 
     /* Create the child process. */
     openChildInfoPipe();
-    start = ustime();
-    if ((childpid = fork()) == 0) {
+    if ((childpid = redisFork()) == 0) {
         /* Child */
         int retval;
         rio slave_sockets;
@@ -2471,7 +2461,6 @@ int rdbSaveToSlavesSockets(rdbSaveInfo *rsi) {
         rioInitWithFdset(&slave_sockets,fds,numfds);
         zfree(fds);
 
-        closeListeningSockets(0);
         redisSetProcTitle("redis-rdb-to-slaves");
 
         retval = rdbSaveRioWithEOFMark(&slave_sockets,NULL,rsi);
@@ -2479,16 +2468,7 @@ int rdbSaveToSlavesSockets(rdbSaveInfo *rsi) {
             retval = C_ERR;
 
         if (retval == C_OK) {
-            size_t private_dirty = zmalloc_get_private_dirty(-1);
-
-            if (private_dirty) {
-                serverLog(LL_NOTICE,
-                    "RDB: %zu MB of memory used by copy-on-write",
-                    private_dirty/(1024*1024));
-            }
-
-            server.child_info_data.cow_size = private_dirty;
-            sendChildInfo(CHILD_INFO_TYPE_RDB);
+            sendChildCOWInfo(CHILD_INFO_TYPE_RDB, "RDB");
 
             /* If we are returning OK, at least one slave was served
              * with the RDB file as expected, so we need to send a report
@@ -2557,16 +2537,11 @@ int rdbSaveToSlavesSockets(rdbSaveInfo *rsi) {
             close(pipefds[1]);
             closeChildInfoPipe();
         } else {
-            server.stat_fork_time = ustime()-start;
-            server.stat_fork_rate = (double) zmalloc_used_memory() * 1000000 / server.stat_fork_time / (1024*1024*1024); /* GB per second. */
-            latencyAddSampleIfNeeded("fork",server.stat_fork_time/1000);
-
             serverLog(LL_NOTICE,"Background RDB transfer started by pid %d",
                 childpid);
             server.rdb_save_time_start = time(NULL);
             server.rdb_child_pid = childpid;
             server.rdb_child_type = RDB_CHILD_TYPE_SOCKET;
-            updateDictResizePolicy();
         }
         zfree(clientids);
         zfree(fds);
@@ -2609,15 +2584,15 @@ void bgsaveCommand(client *c) {
 
     if (server.rdb_child_pid != -1) {
         addReplyError(c,"Background save already in progress");
-    } else if (server.aof_child_pid != -1) {
+    } else if (hasActiveChildProcess()) {
         if (schedule) {
             server.rdb_bgsave_scheduled = 1;
             addReplyStatus(c,"Background saving scheduled");
         } else {
             addReplyError(c,
-                "An AOF log rewriting in progress: can't BGSAVE right now. "
-                "Use BGSAVE SCHEDULE in order to schedule a BGSAVE whenever "
-                "possible.");
+            "Another child process is active (AOF?): can't BGSAVE right now. "
+            "Use BGSAVE SCHEDULE in order to schedule a BGSAVE whenever "
+            "possible.");
         }
     } else if (rdbSaveBackground(server.rdb_filename,rsiptr) == C_OK) {
         addReplyStatus(c,"Background saving started");

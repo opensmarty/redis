@@ -179,6 +179,14 @@ typedef long long mstime_t; /* millisecond time type. */
 #define ACTIVE_EXPIRE_CYCLE_SLOW 0
 #define ACTIVE_EXPIRE_CYCLE_FAST 1
 
+/* Children process will exit with this status code to signal that the
+ * process terminated without an error: this is useful in order to kill
+ * a saving child (RDB or AOF one), without triggering in the parent the
+ * write protection that is normally turned on on write errors.
+ * Usually children that are terminated with SIGUSR1 will exit with this
+ * special code. */
+#define SERVER_CHILD_NOERROR_RETVAL    255
+
 /* Instantaneous metrics tracking. */
 #define STATS_METRIC_SAMPLES 16     /* Number of samples per metric. */
 #define STATS_METRIC_COMMAND 0      /* Number of commands executed. */
@@ -848,7 +856,7 @@ typedef struct client {
     uint64_t flags;         /* Client flags: CLIENT_* macros. */
     int authenticated;      /* Needed when the default user requires auth. */
     int replstate;          /* Replication state if this is a slave. */
-    int repl_put_online_on_ack; /* Install slave write handler on ACK. */
+    int repl_put_online_on_ack; /* Install slave write handler on first ACK. */
     int repldbfd;           /* Replication DB file descriptor. */
     off_t repldboff;        /* Replication DB file offset. */
     off_t repldbsize;       /* Replication DB file size. */
@@ -897,7 +905,7 @@ struct moduleLoadQueueEntry {
 
 struct sharedObjectsStruct {
     robj *crlf, *ok, *err, *emptybulk, *czero, *cone, *pong, *space,
-    *colon, *queued, *null[4], *nullarray[4],
+    *colon, *queued, *null[4], *nullarray[4], *emptymap[4], *emptyset[4],
     *emptyarray, *wrongtypeerr, *nokeyerr, *syntaxerr, *sameobjecterr,
     *outofrangeerr, *noscripterr, *loadingerr, *slowscripterr, *bgsaveerr,
     *masterdownerr, *roslaveerr, *execaborterr, *noautherr, *noreplicaserr,
@@ -1041,6 +1049,7 @@ struct clusterState;
 #define CHILD_INFO_MAGIC 0xC17DDA7A12345678LL
 #define CHILD_INFO_TYPE_RDB 0
 #define CHILD_INFO_TYPE_AOF 1
+#define CHILD_INFO_TYPE_MODULE 3
 
 struct redisServer {
     /* General */
@@ -1076,6 +1085,7 @@ struct redisServer {
     int module_blocked_pipe[2]; /* Pipe used to awake the event loop if a
                                    client blocked on a module command needs
                                    to be processed. */
+    pid_t module_child_pid;     /* PID of module child */
     /* Networking */
     int port;                   /* TCP listening port */
     int tcp_backlog;            /* TCP listen() backlog */
@@ -1149,6 +1159,7 @@ struct redisServer {
     _Atomic long long stat_net_output_bytes; /* Bytes written to network. */
     size_t stat_rdb_cow_bytes;      /* Copy on write bytes during RDB saving. */
     size_t stat_aof_cow_bytes;      /* Copy on write bytes during AOF rewrite. */
+    size_t stat_module_cow_bytes;   /* Copy on write bytes during module fork. */
     /* The following two are used to track instantaneous metrics, like
      * number of operations per second, network traffic. */
     struct {
@@ -1540,7 +1551,10 @@ void moduleAcquireGIL(void);
 void moduleReleaseGIL(void);
 void moduleNotifyKeyspaceEvent(int type, const char *event, robj *key, int dbid);
 void moduleCallCommandFilters(client *c);
+void ModuleForkDoneHandler(int exitcode, int bysignal);
+int TerminateModuleForkChild(int child_pid, int wait);
 ssize_t rdbSaveModulesAux(rio *rdb, int when);
+int moduleAllDatatypesHandleErrors();
 
 /* Utils */
 long long ustime(void);
@@ -1801,6 +1815,11 @@ void openChildInfoPipe(void);
 void closeChildInfoPipe(void);
 void sendChildInfo(int process_type);
 void receiveChildInfo(void);
+
+/* Fork helpers */
+int redisFork();
+int hasActiveChildProcess();
+void sendChildCOWInfo(int ptype, char *pname);
 
 /* acl.c -- Authentication related prototypes. */
 extern rax *Users;
@@ -2334,6 +2353,7 @@ void bugReportStart(void);
 void serverLogObjectDebugInfo(const robj *o);
 void sigsegvHandler(int sig, siginfo_t *info, void *secret);
 sds genRedisInfoString(char *section);
+sds genModulesInfoString(sds info);
 void enableWatchdog(int period);
 void disableWatchdog(void);
 void watchdogScheduleSignal(int period);
